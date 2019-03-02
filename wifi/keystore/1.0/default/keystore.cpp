@@ -111,7 +111,7 @@ Return<void> Keystore::getPublicKey(const hidl_string& keyId, getPublicKey_cb _h
 
     auto export_result = future.get();
     if (!export_result.resultCode.isOk()) {
-        LOG(ERROR) << AT << "exportKey failed: " << int32_t(export_result.resultCode);
+        LOG(ERROR) << AT << "exportKey failed: " << export_result.resultCode;
         _hidl_cb(KeystoreStatusCode::ERROR_UNKNOWN, {});
         return Void();
     }
@@ -165,7 +165,7 @@ Return<void> Keystore::sign(const hidl_string& keyId, const hidl_vec<uint8_t>& d
 
     auto [km_response, characteristics] = kc_future.get();
 
-    if (KSReturn(km_response.response_code()).isOk()) {
+    if (!KSReturn(km_response.response_code()).isOk()) {
         LOG(ERROR) << AT << "getKeyCharacteristics failed: " << km_response.response_code();
         _hidl_cb(KeystoreStatusCode::ERROR_UNKNOWN, {});
         return Void();
@@ -197,14 +197,14 @@ Return<void> Keystore::sign(const hidl_string& keyId, const hidl_vec<uint8_t>& d
 
     rc = KSReturn(error_code);
     if (!rc.isOk()) {
-        LOG(ERROR) << AT << "Keystore begin returned: " << int32_t(rc);
+        LOG(ERROR) << AT << "Keystore begin returned: " << rc;
         _hidl_cb(KeystoreStatusCode::ERROR_UNKNOWN, {});
         return Void();
     }
 
     OperationResult result = future.get();
     if (!result.resultCode.isOk()) {
-        LOG(ERROR) << AT << "begin failed: " << int32_t(result.resultCode);
+        LOG(ERROR) << AT << "begin failed: " << result.resultCode;
         _hidl_cb(KeystoreStatusCode::ERROR_UNKNOWN, {});
         return Void();
     }
@@ -213,7 +213,8 @@ Return<void> Keystore::sign(const hidl_string& keyId, const hidl_vec<uint8_t>& d
     const uint8_t* in = dataToSign.data();
     size_t len = dataToSign.size();
     do {
-        future = {};
+        promise = new OperationResultPromise();
+        future = promise->get_future();
         binder_result = service->update(promise, handle, KeymasterArguments(params),
                                         std::vector<uint8_t>(in, in + len), &error_code);
         if (!binder_result.isOk()) {
@@ -224,7 +225,7 @@ Return<void> Keystore::sign(const hidl_string& keyId, const hidl_vec<uint8_t>& d
 
         rc = KSReturn(error_code);
         if (!rc.isOk()) {
-            LOG(ERROR) << AT << "Keystore update returned: " << int32_t(rc);
+            LOG(ERROR) << AT << "Keystore update returned: " << rc;
             _hidl_cb(KeystoreStatusCode::ERROR_UNKNOWN, {});
             return Void();
         }
@@ -232,7 +233,7 @@ Return<void> Keystore::sign(const hidl_string& keyId, const hidl_vec<uint8_t>& d
         result = future.get();
 
         if (!result.resultCode.isOk()) {
-            LOG(ERROR) << AT << "update failed: " << int32_t(result.resultCode);
+            LOG(ERROR) << AT << "update failed: " << result.resultCode;
             _hidl_cb(KeystoreStatusCode::ERROR_UNKNOWN, {});
             return Void();
         }
@@ -252,7 +253,7 @@ Return<void> Keystore::sign(const hidl_string& keyId, const hidl_vec<uint8_t>& d
             if (!KSReturn(error_code).isOk()) {
                 LOG(ERROR) << AT << "abort failed: " << error_code;
             } else if (!(rc = KSReturn(abortFuture.get().response_code())).isOk()) {
-                LOG(ERROR) << AT << "abort failed: " << int32_t(rc);
+                LOG(ERROR) << AT << "abort failed: " << rc;
             }
             _hidl_cb(KeystoreStatusCode::ERROR_UNKNOWN, {});
             return Void();
@@ -276,7 +277,7 @@ Return<void> Keystore::sign(const hidl_string& keyId, const hidl_vec<uint8_t>& d
 
     rc = KSReturn(error_code);
     if (!rc.isOk()) {
-        LOG(ERROR) << AT << "Keystore finish returned: " << int32_t(rc);
+        LOG(ERROR) << AT << "Keystore finish returned: " << rc;
         _hidl_cb(KeystoreStatusCode::ERROR_UNKNOWN, {});
         return Void();
     }
@@ -284,7 +285,7 @@ Return<void> Keystore::sign(const hidl_string& keyId, const hidl_vec<uint8_t>& d
     result = future.get();
 
     if (!result.resultCode.isOk()) {
-        LOG(ERROR) << AT << "finish failed: " << int32_t(result.resultCode);
+        LOG(ERROR) << AT << "finish failed: " << result.resultCode;
         _hidl_cb(KeystoreStatusCode::ERROR_UNKNOWN, {});
         return Void();
     }

@@ -32,6 +32,7 @@
 // later when a module using the interface is updated, e.g., Mainline modules.
 
 package android.media.audio.common;
+/* @hide */
 @JavaDerive(equals=true, toString=true) @VintfStability
 parcelable AudioHalAttributesGroup {
   android.media.audio.common.AudioStreamType streamType = android.media.audio.common.AudioStreamType.INVALID;

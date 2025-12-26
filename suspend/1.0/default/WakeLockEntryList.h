@@ -51,12 +51,17 @@ class WakeLockEntryList {
     void updateNow();
     void getWakeLockStats(int wakeLockInfoFieldBitMask,
                           std::vector<WakeLockInfo>* aidl_return) const;
+    int nrActiveHolders(const std::string& name, int pid);
+    void clear();
     friend std::ostream& operator<<(std::ostream& out, const WakeLockEntryList& list);
 
    private:
     void evictIfFull() REQUIRES(mLock);
     void insertEntry(WakeLockInfo entry) REQUIRES(mLock);
     void deleteEntry(std::list<WakeLockInfo>::iterator entry) REQUIRES(mLock);
+    void updateEntry(WakeLockInfo updatedEntry,
+                     std::list<WakeLockInfo>::iterator staleEntry)
+            REQUIRES(mLock);
     WakeLockInfo createNativeEntry(const std::string& name, int pid, TimestampType timeNow) const;
     WakeLockInfo createKernelEntry(const std::string& name) const;
 
@@ -101,10 +106,10 @@ class WakeLockEntryList {
         class LockedFd {
            public:
             int get() const { return mFdWithMutex->mFd; }
-            bool isValid() const { return mFdWithMutex->mFd != -1; }
-
-            void clear() { mFdWithMutex->mFd.reset(); }
             void set(unique_fd&& newFd) { mFdWithMutex->mFd = std::move(newFd); }
+
+            bool isValid() const { return mFdWithMutex->mFd != -1; }
+            void invalidate() { mFdWithMutex->mFd.reset(); }
 
             // Need move ctor and assignment for std::optional<LockedFd>.
             LockedFd(LockedFd&& other) {
@@ -139,6 +144,10 @@ class WakeLockEntryList {
         unique_fd mFd;
     };
 
+    int openFDAndUpdateCache(const std::string& statName, const std::string& kwlId,
+                             std::optional<FdWithMutex::LockedFd>* acquiredFd) const
+        REQUIRES(mLock);
+
     mutable std::unordered_map<std::string, unique_fd> mFdCache GUARDED_BY(mLock);
     mutable std::unordered_map<std::string, FdWithMutex> mFdWithMutexCache GUARDED_BY(mLock);
 
@@ -148,6 +157,8 @@ class WakeLockEntryList {
     std::list<WakeLockInfo> mStats GUARDED_BY(mLock);
     std::unordered_map<std::pair<std::string, int>, std::list<WakeLockInfo>::iterator, LockHash>
         mLookupTable GUARDED_BY(mLock);
+    // Map to track the live hold count for each wakelock.
+    std::unordered_map<std::pair<std::string, int>, int, LockHash> mNrActiveHolders GUARDED_BY(mLock);
 };
 
 }  // namespace V1_0

@@ -154,11 +154,12 @@ class SystemSuspendTest : public ::testing::Test {
         ASSERT_NE(suspendService, nullptr) << "failed to get suspend service";
 
         sp<IBinder> control =
-            android::defaultServiceManager()->getService(android::String16(kControlServiceName));
+            android::defaultServiceManager()->waitForService(
+                            android::String16(kControlServiceName));
         ASSERT_NE(control, nullptr) << "failed to get the suspend control service";
         sp<ISuspendControlService> controlService = interface_cast<ISuspendControlService>(control);
 
-        sp<IBinder> controlInternal = android::defaultServiceManager()->getService(
+        sp<IBinder> controlInternal = android::defaultServiceManager()->waitForService(
             android::String16(kControlServiceInternalName));
         ASSERT_NE(controlInternal, nullptr) << "failed to get the suspend control internal service";
         sp<ISuspendControlServiceInternal> controlServiceInternal =
@@ -177,16 +178,18 @@ class SystemSuspendTest : public ::testing::Test {
 
    public:
     virtual void SetUp() override {
+        systemSuspend->getWakeLockEntryList()->clear();
         suspendService = ISystemSuspend::fromBinder(
             ndk::SpAIBinder(AServiceManager_waitForService(kServiceName)));
         ASSERT_NE(suspendService, nullptr) << "failed to get suspend service";
 
         sp<IBinder> control =
-            android::defaultServiceManager()->getService(android::String16(kControlServiceName));
+            android::defaultServiceManager()->waitForService(
+                            android::String16(kControlServiceName));
         ASSERT_NE(control, nullptr) << "failed to get the suspend control service";
         controlService = interface_cast<ISuspendControlService>(control);
 
-        sp<IBinder> controlInternal = android::defaultServiceManager()->getService(
+        sp<IBinder> controlInternal = android::defaultServiceManager()->waitForService(
             android::String16(kControlServiceInternalName));
         ASSERT_NE(controlInternal, nullptr) << "failed to get the suspend control internal service";
         controlServiceInternal = interface_cast<ISuspendControlServiceInternal>(controlInternal);
@@ -234,8 +237,8 @@ class SystemSuspendTest : public ::testing::Test {
         return count_if(wlStats.begin(), wlStats.end(), [](auto entry) { return entry.isActive; });
     }
 
-    // Wait for wakelock's active count to reach a certain value.
-    bool waitForActiveCount(
+    // Wait for wakelock's hold count to reach a certain value.
+    bool waitForNrActiveHolders(
         const std::string& wl_name, int expectedCount,
         std::chrono::milliseconds timeout = std::chrono::milliseconds(100),
         std::chrono::milliseconds pollingInterval = std::chrono::milliseconds(10)) {
@@ -243,8 +246,10 @@ class SystemSuspendTest : public ::testing::Test {
         while (std::chrono::steady_clock::now() - start_time < timeout) {
             std::vector<WakeLockInfo> wlStats = getWakelockStats();
             WakeLockInfo wlInfo;
+
             if (findWakeLockInfoByName(wlStats, wl_name, &wlInfo) &&
-                wlInfo.activeCount == expectedCount) {
+                expectedCount == systemSuspend->getWakeLockEntryList()
+                                ->nrActiveHolders(wl_name, wlInfo.pid)) {
                 return true;
             }
             std::this_thread::sleep_for(pollingInterval);
@@ -894,9 +899,9 @@ TEST_F(SystemSuspendTest, CallbackNotifyWakelock) {
     cb2->disable();
 }
 
-// Tests for a potential race condition in wakelock stats updates.
-// This checks wakelock accounting when a wakelock is acquired and released, and a re-acquire
-// happens immediately.
+// Tests for a potential race condition in wakelock stats updates. This checks
+// wakelock accounting when a wakelock is acquired and released, and a
+// re-acquire happens immediately.
 TEST_F(SystemSuspendTest, WakeLockStatsRaceConditionTest) {
     constexpr int kNumRetries = 100;
 
@@ -914,31 +919,32 @@ TEST_F(SystemSuspendTest, WakeLockStatsRaceConditionTest) {
         ASSERT_NE(wlB, nullptr);
 
         // Let the release operation complete.
-        EXPECT_TRUE(waitForActiveCount(testLockName, 1))
+        EXPECT_TRUE(waitForNrActiveHolders(testLockName, 1))
             << "Timeout waiting for activeCount to reach 1 (retry: " << i << ")";
 
         std::vector<WakeLockInfo> wlStats = getWakelockStats();
         WakeLockInfo wlInfo;
         ASSERT_TRUE(findWakeLockInfoByName(wlStats, testLockName, &wlInfo));
         EXPECT_TRUE(wlInfo.isActive);
-        EXPECT_EQ(wlInfo.activeCount, 1);
+        EXPECT_EQ(wlInfo.activeCount, 2);
 
         wlB->release();
-        EXPECT_TRUE(waitForActiveCount(testLockName, 0))
+        EXPECT_TRUE(waitForNrActiveHolders(testLockName, 0))
             << "Timeout waiting for activeCount to reach 0 (retry: " << i << ")";
 
         wlStats = getWakelockStats();
         ASSERT_TRUE(findWakeLockInfoByName(wlStats, testLockName, &wlInfo));
         EXPECT_FALSE(wlInfo.isActive);
-        EXPECT_EQ(wlInfo.activeCount, 0);
+        EXPECT_EQ(wlInfo.activeCount, 2);
         EXPECT_EQ(wlInfo.activeTime, 0);
     }
 }
 
-// Tests for correctness of the wakelock active count, active status and active time when multiple
-// wakelocks of the same name are acquired and released sequentially.
+// Tests for correctness of the wakelock active holders, activeCount, active
+// statusand active time when multiple wakelocks of the same name are acquired
+// and released sequentially.
 // Order tested: Acq A -> Acq B -> Rel A -> Rel B.
-TEST_F(SystemSuspendTest, WakeLockStatsActiveCountDecrementCheck) {
+TEST_F(SystemSuspendTest, WakeLockStatsNrActiveHoldersDecrementCheck) {
     std::string testLockName = "testLock";
 
     std::shared_ptr<IWakeLock> wlA = acquireWakeLock(testLockName);
@@ -960,8 +966,8 @@ TEST_F(SystemSuspendTest, WakeLockStatsActiveCountDecrementCheck) {
 
     wlA->release();
     // Let the release operation complete.
-    EXPECT_TRUE(waitForActiveCount(testLockName, 1))
-            << "Timeout waiting for activeCount to reach 1";
+    EXPECT_TRUE(waitForNrActiveHolders(testLockName, 1))
+            << "Timeout waiting for nrActiveHolders to reach 1";
     // Sleep for 5ms to test activeTime update later.
     std::this_thread::sleep_for(5ms);
 
@@ -969,22 +975,23 @@ TEST_F(SystemSuspendTest, WakeLockStatsActiveCountDecrementCheck) {
     ASSERT_TRUE(findWakeLockInfoByName(wlStats, testLockName, &wlInfo));
     // wlB of the same name is yet to be released.
     EXPECT_TRUE(wlInfo.isActive);
-    EXPECT_EQ(wlInfo.activeCount, 1);
+    EXPECT_EQ(wlInfo.activeCount, 2);
     EXPECT_GE(wlInfo.activeTime, 5);
 
     wlB->release();
-    EXPECT_TRUE(waitForActiveCount(testLockName, 0))
-            << "Timeout waiting for activeCount to reach 0";
+    EXPECT_TRUE(waitForNrActiveHolders(testLockName, 0))
+            << "Timeout waiting for nrActiveHolders to reach 0";
 
     wlStats = getWakelockStats();
     ASSERT_TRUE(findWakeLockInfoByName(wlStats, testLockName, &wlInfo));
     EXPECT_FALSE(wlInfo.isActive);
-    EXPECT_EQ(wlInfo.activeCount, 0);
+    EXPECT_EQ(wlInfo.activeCount, 2);
     EXPECT_EQ(wlInfo.activeTime, 0);
 }
 
-// Tests for correctness of the wakelock active count, active status and active time when multiple
-// wakelocks are acquired and released sequentially.
+// Tests for correctness of the wakelock active holders, activeCount, active
+// status and active time when multiple wakelocks are acquired and released
+// sequentially.
 // Order tested: Acq A -> Acq B -> Rel B -> Rel A.
 TEST_F(SystemSuspendTest, WakeLockStatsAcquiredReleasedInLIFOOrder) {
     std::string testLockName = "testLock";
@@ -1008,8 +1015,8 @@ TEST_F(SystemSuspendTest, WakeLockStatsAcquiredReleasedInLIFOOrder) {
 
     wlB->release();
     // Let the release operation complete.
-    EXPECT_TRUE(waitForActiveCount(testLockName, 1))
-            << "Timeout waiting for activeCount to reach 1";
+    EXPECT_TRUE(waitForNrActiveHolders(testLockName, 1))
+            << "Timeout waiting for nrActiveHolders to reach 1";
     // Sleep for 5ms to test activeTime update later.
     std::this_thread::sleep_for(5ms);
 
@@ -1017,17 +1024,17 @@ TEST_F(SystemSuspendTest, WakeLockStatsAcquiredReleasedInLIFOOrder) {
     ASSERT_TRUE(findWakeLockInfoByName(wlStats, testLockName, &wlInfo));
     // wlB of the same name is yet to be released.
     EXPECT_TRUE(wlInfo.isActive);
-    EXPECT_EQ(wlInfo.activeCount, 1);
+    EXPECT_EQ(wlInfo.activeCount, 2);
     EXPECT_GE(wlInfo.activeTime, 5);
 
     wlA->release();
-    EXPECT_TRUE(waitForActiveCount(testLockName, 0))
-            << "Timeout waiting for activeCount to reach 0";
+    EXPECT_TRUE(waitForNrActiveHolders(testLockName, 0))
+            << "Timeout waiting for nrActiveHolders to reach 0";
 
     wlStats = getWakelockStats();
     ASSERT_TRUE(findWakeLockInfoByName(wlStats, testLockName, &wlInfo));
     EXPECT_FALSE(wlInfo.isActive);
-    EXPECT_EQ(wlInfo.activeCount, 0);
+    EXPECT_EQ(wlInfo.activeCount, 2);
     EXPECT_EQ(wlInfo.activeTime, 0);
 }
 
@@ -1273,6 +1280,7 @@ class mock_flag_provider_interface : public suspend_service::flags::flag_provide
     MOCK_METHOD(bool, fast_kernel_wakelock_reporting, (), (override));
     MOCK_METHOD(bool, fast_kernel_wakelock_reporting_v2, (), (override));
     MOCK_METHOD(bool, suspend_backoff_observability, (), (override));
+    MOCK_METHOD(bool, extended_suspend_info, (), (override));
 };
 
 enum class KernelWakeLockFdType { Uncached, CachedV1, CachedV2 };
@@ -1325,7 +1333,7 @@ TEST_F(SystemSuspendSameThreadTest, GetNativeWakeLockStats) {
     WakeLockInfo nwlInfo;
     ASSERT_TRUE(findWakeLockInfoByName(wlStats, fakeWlName, &nwlInfo));
     ASSERT_EQ(nwlInfo.name, fakeWlName);
-    ASSERT_EQ(nwlInfo.activeCount, 0);
+    ASSERT_EQ(nwlInfo.activeCount, 1);
     ASSERT_GE(nwlInfo.maxTime, 1000);
     ASSERT_GE(nwlInfo.totalTime, 1000);
     ASSERT_EQ(nwlInfo.isActive, false);
@@ -1450,7 +1458,7 @@ TEST_P(ParameterizedSystemSuspendSameThreadTest, GetNativeAndKernelWakeLockStats
     WakeLockInfo nwlInfo;
     ASSERT_TRUE(findWakeLockInfoByName(wlStats, fakeNwlName, &nwlInfo));
     ASSERT_EQ(nwlInfo.name, fakeNwlName);
-    ASSERT_EQ(nwlInfo.activeCount, 0);
+    ASSERT_EQ(nwlInfo.activeCount, 1);
     ASSERT_GE(nwlInfo.maxTime, 1000);
     ASSERT_GE(nwlInfo.totalTime, 1000);
     ASSERT_EQ(nwlInfo.isActive, false);
@@ -1531,9 +1539,14 @@ TEST_F(SystemSuspendSameThreadTest, GetSuspendStats) {
     ASSERT_EQ(stats.maxHwSleep, 523986009990);
 }
 
-class SuspendWakeupTest : public ::testing::Test {
+class SuspendWakeupTest : public ::testing::TestWithParam<bool> {
    public:
     virtual void SetUp() override {
+        auto mock_flag_provider = std::make_unique<mock_flag_provider_interface>();
+        ON_CALL(*mock_flag_provider, extended_suspend_info())
+            .WillByDefault(::testing::Return(GetParam()));
+        suspend_service::flags::provider_ = std::move(mock_flag_provider);
+
         Socketpair(SOCK_STREAM, &wakeupCountTestFd, &wakeupCountServiceFd);
         Socketpair(SOCK_STREAM, &stateTestFd, &stateServiceFd);
 
@@ -1616,6 +1629,11 @@ class SuspendWakeupTest : public ::testing::Test {
         ASSERT_EQ(actual.newBackoffCount, expected.newBackoffCount);
         ASSERT_EQ(actual.backoffContinueCount, expected.backoffContinueCount);
         ASSERT_EQ(actual.sleepTimeMillis, expected.sleepTimeMillis);
+        ASSERT_EQ(actual.suspendDurationMillisBins, expected.suspendDurationMillisBins);
+        ASSERT_EQ(actual.consecutiveBadSuspendBins, expected.consecutiveBadSuspendBins);
+        ASSERT_EQ(actual.newBadSuspends, expected.newBadSuspends);
+        ASSERT_EQ(actual.earlyRecoveryBadSuspends, expected.earlyRecoveryBadSuspends);
+        ASSERT_EQ(actual.maxBackoffContinuations, expected.maxBackoffContinuations);
     }
 
     unique_fd wakeupCountServiceFd;
@@ -1647,7 +1665,8 @@ class SuspendWakeupTest : public ::testing::Test {
     const int64_t kSuspendOverheadMillis = 20;
 };
 
-TEST_F(SuspendWakeupTest, LongSuspendStat) {
+TEST_P(SuspendWakeupTest, LongSuspendStat) {
+    bool flagEnabled = GetParam();
     suspendFor(std::chrono::milliseconds(kLongSuspendMillis),
                std::chrono::milliseconds(kSuspendOverheadMillis), 1);
     SuspendInfo expected;
@@ -1655,10 +1674,14 @@ TEST_F(SuspendWakeupTest, LongSuspendStat) {
     expected.suspendTimeMillis = kLongSuspendMillis;
     expected.suspendOverheadTimeMillis = kSuspendOverheadMillis;
     expected.sleepTimeMillis = kSleepTimeConfig.baseSleepTime.count();
+    if (flagEnabled){
+        expected.suspendDurationMillisBins = {0, 0, 0, 0, 1, 0};
+    }
     checkSuspendInfo(expected);
 }
 
-TEST_F(SuspendWakeupTest, ShortSuspendStat) {
+TEST_P(SuspendWakeupTest, ShortSuspendStat) {
+    bool flagEnabled = GetParam();
     suspendFor(std::chrono::milliseconds(kShortSuspendMillis),
                std::chrono::milliseconds(kSuspendOverheadMillis), 1);
     SuspendInfo expected;
@@ -1668,10 +1691,15 @@ TEST_F(SuspendWakeupTest, ShortSuspendStat) {
     expected.suspendTimeMillis = kShortSuspendMillis;
     expected.suspendOverheadTimeMillis = kSuspendOverheadMillis;
     expected.sleepTimeMillis = kSleepTimeConfig.baseSleepTime.count();
+    if (flagEnabled) {
+        expected.newBadSuspends = 1;
+        expected.suspendDurationMillisBins = {1, 0, 0, 0, 0, 0};
+    }
     checkSuspendInfo(expected);
 }
 
-TEST_F(SuspendWakeupTest, ShortSuspendBackoffStat) {
+TEST_P(SuspendWakeupTest, ShortSuspendBackoffStat) {
+    bool flagEnabled = GetParam();
     suspendFor(std::chrono::milliseconds(kShortSuspendMillis),
                std::chrono::milliseconds(kSuspendOverheadMillis), 2);
     SuspendInfo expected;
@@ -1682,10 +1710,15 @@ TEST_F(SuspendWakeupTest, ShortSuspendBackoffStat) {
     expected.suspendOverheadTimeMillis = kSuspendOverheadMillis * 2;
     expected.newBackoffCount = 1;
     expected.sleepTimeMillis = kSleepTimeConfig.baseSleepTime.count() * 2;
+    if (flagEnabled) {
+        expected.newBadSuspends = 1;
+        expected.suspendDurationMillisBins = {2, 0, 0, 0, 0, 0};
+    }
     checkSuspendInfo(expected);
 }
 
-TEST_F(SuspendWakeupTest, ShortSuspendBackoffContinueStat) {
+TEST_P(SuspendWakeupTest, ShortSuspendBackoffContinueStat) {
+    bool flagEnabled = GetParam();
     suspendFor(std::chrono::milliseconds(kShortSuspendMillis),
                std::chrono::milliseconds(kSuspendOverheadMillis), 2);
     SuspendInfo expected;
@@ -1696,6 +1729,10 @@ TEST_F(SuspendWakeupTest, ShortSuspendBackoffContinueStat) {
     expected.suspendOverheadTimeMillis = kSuspendOverheadMillis * 2;
     expected.newBackoffCount = 1;
     expected.sleepTimeMillis = kSleepTimeConfig.baseSleepTime.count() * 2;
+    if (flagEnabled) {
+        expected.newBadSuspends = 1;
+        expected.suspendDurationMillisBins = {2, 0, 0, 0, 0, 0};
+    }
     checkSuspendInfo(expected);
 
     suspendFor(std::chrono::milliseconds(kShortSuspendMillis),
@@ -1710,10 +1747,93 @@ TEST_F(SuspendWakeupTest, ShortSuspendBackoffContinueStat) {
         std::chrono::round<std::chrono::milliseconds>(kSleepTimeConfig.baseSleepTime *
                                                       kSleepTimeConfig.sleepTimeScaleFactor)
             .count();
+    if (flagEnabled) {
+        expected.suspendDurationMillisBins = {3, 0, 0, 0, 0, 0};
+    }
     checkSuspendInfo(expected);
 }
 
-TEST_F(SuspendWakeupTest, GetSingleWakeupReasonStat) {
+TEST_P(SuspendWakeupTest, MaxBackoffContinuationStat) {
+    bool flagEnabled = GetParam();
+    suspendFor(std::chrono::milliseconds(kShortSuspendMillis),
+               std::chrono::milliseconds(kSuspendOverheadMillis), 6);
+
+    SuspendInfo expected;
+    expected.suspendAttemptCount = 6;
+    expected.shortSuspendCount = 6;
+    expected.shortSuspendTimeMillis = 6 * kShortSuspendMillis;
+    expected.suspendTimeMillis = 6 * kShortSuspendMillis;
+    expected.suspendOverheadTimeMillis = 6 * kSuspendOverheadMillis;
+    expected.newBackoffCount = 1;
+    expected.sleepTimeMillis = kSleepTimeConfig.maxSleepTime.count();
+
+    long baseDelay = kSleepTimeConfig.baseSleepTime.count();
+    long firstBackoff =
+        std::chrono::round<std::chrono::milliseconds>(std::chrono::milliseconds(baseDelay) *
+                                                      kSleepTimeConfig.sleepTimeScaleFactor)
+            .count();
+    long secondBackoff =
+        std::chrono::round<std::chrono::milliseconds>(std::chrono::milliseconds(firstBackoff) *
+                                                      kSleepTimeConfig.sleepTimeScaleFactor)
+            .count();
+    long maxBackoff = kSleepTimeConfig.maxSleepTime.count();
+
+    expected.sleepTimeMillis = baseDelay +      // 100ms
+                               baseDelay +      // 100ms
+                               firstBackoff +   // 190ms
+                               secondBackoff +  // 361ms
+                               maxBackoff +     // 400ms
+                               maxBackoff;      // 400ms
+
+    expected.backoffContinueCount = 4;
+    if (flagEnabled) {
+        expected.newBadSuspends = 1;
+        expected.maxBackoffContinuations = 2;
+        expected.suspendDurationMillisBins = {6, 0, 0, 0, 0, 0};
+    }
+
+    checkSuspendInfo(expected);
+}
+
+TEST_P(SuspendWakeupTest, ConsecutiveBadSuspendHistogramStat) {
+    bool flagEnabled = GetParam();
+    // First sequence: 1 bad suspend, then a good one -> sample of 2
+    suspendFor(std::chrono::milliseconds(kShortSuspendMillis),
+               std::chrono::milliseconds(kSuspendOverheadMillis), 1);
+    suspendFor(std::chrono::milliseconds(kLongSuspendMillis),
+               std::chrono::milliseconds(kSuspendOverheadMillis), 1);
+
+    // Second sequence: 2 bad suspends, then a good one -> sample of 3
+    suspendFor(std::chrono::milliseconds(kShortSuspendMillis),
+               std::chrono::milliseconds(kSuspendOverheadMillis), 2);
+    suspendFor(std::chrono::milliseconds(kLongSuspendMillis),
+               std::chrono::milliseconds(kSuspendOverheadMillis), 1);
+
+    SuspendInfo expected;
+    expected.suspendAttemptCount = 5;
+    expected.shortSuspendCount = 3;
+    expected.shortSuspendTimeMillis = 3 * kShortSuspendMillis;
+    expected.suspendTimeMillis =  3 * kShortSuspendMillis + 2 * kLongSuspendMillis;
+    expected.suspendOverheadTimeMillis = 5 * kSuspendOverheadMillis;
+    expected.newBackoffCount = 1;
+
+    long baseDelay = kSleepTimeConfig.baseSleepTime.count();
+    long firstBackoff =
+        std::chrono::round<std::chrono::milliseconds>(std::chrono::milliseconds(baseDelay) *
+                                                      kSleepTimeConfig.sleepTimeScaleFactor)
+            .count();
+
+    expected.sleepTimeMillis = 4 * baseDelay + firstBackoff;
+    if (flagEnabled) {
+        expected.suspendDurationMillisBins = {3, 0, 0, 0, 2, 0};
+        expected.consecutiveBadSuspendBins = {1, 1, 0, 0, 0};
+        expected.newBadSuspends = 2;
+    }
+
+    checkSuspendInfo(expected);
+}
+
+TEST_P(SuspendWakeupTest, GetSingleWakeupReasonStat) {
     wakeup("abc");
 
     std::vector<WakeupInfo> wStats;
@@ -1723,7 +1843,7 @@ TEST_F(SuspendWakeupTest, GetSingleWakeupReasonStat) {
     ASSERT_EQ(wStats[0].count, 1);
 }
 
-TEST_F(SuspendWakeupTest, GetChainedWakeupReasonStat) {
+TEST_P(SuspendWakeupTest, GetChainedWakeupReasonStat) {
     wakeup("a\nb");
 
     std::vector<WakeupInfo> wStats;
@@ -1733,7 +1853,7 @@ TEST_F(SuspendWakeupTest, GetChainedWakeupReasonStat) {
     ASSERT_EQ(wStats[0].count, 1);
 }
 
-TEST_F(SuspendWakeupTest, GetMultipleWakeupReasonStats) {
+TEST_P(SuspendWakeupTest, GetMultipleWakeupReasonStats) {
     wakeup("abc");
     wakeup("d\ne");
     wakeup("");
@@ -1753,6 +1873,8 @@ TEST_F(SuspendWakeupTest, GetMultipleWakeupReasonStats) {
     ASSERT_EQ(wStats[3].name, "d;e");
     ASSERT_EQ(wStats[3].count, 1);
 }
+
+INSTANTIATE_TEST_SUITE_P(SuspendWakeupTest, SuspendWakeupTest, ::testing::Bool());
 
 TEST(WakeupListTest, TestEmpty) {
     WakeupList wakeupList(3);
@@ -1941,8 +2063,8 @@ class SystemSuspendDelayTest : public ::testing::TestWithParam<bool> {
         return std::move(stateServiceFd);
     }
 
-    // Wait for wakelock's active count to reach a certain value.
-    bool waitForActiveCount(
+    // Wait for wakelock's hold count to reach a certain value.
+    bool waitForNrActiveHolders(
         const std::string& wl_name, int expectedCount,
         std::chrono::milliseconds timeout = std::chrono::milliseconds(100),
         std::chrono::milliseconds pollingInterval = std::chrono::milliseconds(10)) {
@@ -1950,8 +2072,10 @@ class SystemSuspendDelayTest : public ::testing::TestWithParam<bool> {
         while (std::chrono::steady_clock::now() - start_time < timeout) {
             std::vector<WakeLockInfo> wlStats = getWakelockStats();
             WakeLockInfo wlInfo;
+
             if (findWakeLockInfoByName(wlStats, wl_name, &wlInfo) &&
-                wlInfo.activeCount == expectedCount) {
+                expectedCount == systemSuspend->getWakeLockEntryList()
+                                ->nrActiveHolders(wl_name, wlInfo.pid)) {
                 return true;
             }
             std::this_thread::sleep_for(pollingInterval);
@@ -2057,15 +2181,15 @@ TEST_P(SystemSuspendDelayFailedTest, SuspendFailedDelayTest) {
                           kSleepTimeConfig.baseSleepTime * kSleepTimeConfig.sleepTimeScaleFactor)
                     : 0ms;
 
-    waitForActiveCount(totalWakelockName, 0, 200ms);
+    waitForNrActiveHolders(totalWakelockName, 0, 200ms);
     auto startTotalTime = findWakelockTimeByName(totalWakelockName);
     auto startFailedTime = findWakelockTimeByName(failedWakelockName);
 
     suspendFor(100ms);
     if (flagEnabled) {
-        EXPECT_TRUE(waitForActiveCount(totalWakelockName, 1))
+        EXPECT_TRUE(waitForNrActiveHolders(totalWakelockName, 1))
                 << "Timeout waiting for suspend delay wakelock to be active";
-        EXPECT_TRUE(waitForActiveCount(totalWakelockName, 0, 200ms))
+        EXPECT_TRUE(waitForNrActiveHolders(totalWakelockName, 0, 200ms))
                 << "Timeout waiting for suspend delay wakelock to be inactive";
     }
 
@@ -2087,15 +2211,15 @@ TEST_P(SystemSuspendDelayTest, SuspendNormalDelayTest) {
         flagEnabled ? std::chrono::round<std::chrono::milliseconds>(kSleepTimeConfig.baseSleepTime)
                     : 0ms;
 
-    waitForActiveCount(totalWakelockName, 0, 200ms);
+    waitForNrActiveHolders(totalWakelockName, 0, 200ms);
     auto startTotalTime = findWakelockTimeByName(totalWakelockName);
     auto startNormalTime = findWakelockTimeByName(normalWakelockName);
 
     suspendFor(100ms);
     if (flagEnabled) {
-        EXPECT_TRUE(waitForActiveCount(totalWakelockName, 1))
+        EXPECT_TRUE(waitForNrActiveHolders(totalWakelockName, 1))
                 << "Timeout waiting for suspend delay wakelock to be active";
-        EXPECT_TRUE(waitForActiveCount(totalWakelockName, 0, 200ms))
+        EXPECT_TRUE(waitForNrActiveHolders(totalWakelockName, 0, 200ms))
                 << "Timeout waiting for suspend delay wakelock to be inactive";
     }
 
@@ -2120,15 +2244,15 @@ TEST_P(SystemSuspendDelayTest, SuspendShortDelayTest) {
                           kSleepTimeConfig.baseSleepTime * kSleepTimeConfig.sleepTimeScaleFactor)
                     : 0ms;
 
-    waitForActiveCount(totalWakelockName, 0, 200ms);
+    waitForNrActiveHolders(totalWakelockName, 0, 200ms);
     auto startTotalTime = findWakelockTimeByName(totalWakelockName);
     auto startShortTime = findWakelockTimeByName(shortWakelockName);
 
     suspendFor(10ms);
     if (flagEnabled) {
-        EXPECT_TRUE(waitForActiveCount(totalWakelockName, 1))
+        EXPECT_TRUE(waitForNrActiveHolders(totalWakelockName, 1))
                 << "Timeout waiting for suspend delay wakelock to be active";
-        EXPECT_TRUE(waitForActiveCount(totalWakelockName, 0, 200ms))
+        EXPECT_TRUE(waitForNrActiveHolders(totalWakelockName, 0, 200ms))
                 << "Timeout waiting for suspend delay wakelock to be inactive";
     }
 

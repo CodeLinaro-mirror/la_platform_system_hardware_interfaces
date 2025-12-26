@@ -166,9 +166,7 @@ void WakeLockEntryList::evictIfFull() {
     if (mStats.size() == mCapacity) {
         auto evictIt = mStats.end();
         std::advance(evictIt, -1);
-        auto evictKey = std::make_pair(evictIt->name, evictIt->pid);
-        mLookupTable.erase(evictKey);
-        mStats.erase(evictIt);
+        deleteEntry(evictIt);
 
         std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
         long long secondsSinceLastLog =
@@ -205,7 +203,29 @@ void WakeLockEntryList::insertEntry(WakeLockInfo entry) {
 void WakeLockEntryList::deleteEntry(std::list<WakeLockInfo>::iterator entry) {
     auto key = std::make_pair(entry->name, entry->pid);
     mLookupTable.erase(key);
+    mNrActiveHolders.erase(key);
     mStats.erase(entry);
+}
+
+/**
+ * Updates entry from stats list while accounting for MRU and other bookkeeping
+ */
+void WakeLockEntryList::updateEntry(WakeLockInfo updatedEntry,
+                                std::list<WakeLockInfo>::iterator staleEntry) {
+    if (updatedEntry.name != staleEntry->name ||
+        updatedEntry.pid != staleEntry->pid) {
+        LOG(ERROR) << "WakeLock Stats: updatedEntry (" << updatedEntry.name <<
+                    ", " << updatedEntry.pid << ") is not the same staleEntry ("
+                         << staleEntry->name << ", " << staleEntry->pid << ")";
+        return;
+    }
+    auto key = std::make_pair(staleEntry->name, staleEntry->pid);
+    int updatedCount = mNrActiveHolders[key];
+
+    // mNrActiveHolders[key] should not be reset on an update, so save its value
+    deleteEntry(staleEntry);
+    mNrActiveHolders[key] = updatedCount;
+    insertEntry(std::move(updatedEntry));
 }
 
 /**
@@ -352,6 +372,31 @@ WakeLockInfo WakeLockEntryList::createKernelEntry(const std::string& kwlId) cons
     return info;
 }
 
+int WakeLockEntryList::openFDAndUpdateCache(
+    const std::string& statName, const std::string& kwlId,
+    std::optional<FdWithMutex::LockedFd>* acquiredFd) const {
+    unique_fd tmpFd(
+        TEMP_FAILURE_RETRY(openat(mKernelWakelockStatsFd, statName.c_str(), O_CLOEXEC | O_RDONLY)));
+    if (tmpFd < 0) {
+        PLOG(ERROR) << "Error opening " << statName << " for " << kwlId;
+        return -1;
+    }
+    int ret = tmpFd;
+
+    if (fast_kernel_wakelock_reporting_v2()) {
+        if (acquiredFd->has_value()) {
+            (*acquiredFd)->set(std::move(tmpFd));
+        } else {
+            auto result = mFdWithMutexCache.emplace(statName, std::move(tmpFd));
+            *acquiredFd = result.first->second.acquire();
+        }
+    } else {
+        mFdCache[statName] = std::move(tmpFd);
+    }
+
+    return ret;
+}
+
 /*
  * Creates and returns a kernel wakelock entry with data read from mKernelWakelockStatsFd.
  * Has been micro-optimized to reduce CPU time and wall time.
@@ -395,35 +440,24 @@ WakeLockInfo WakeLockEntryList::createKernelEntry(ScratchSpace* ss, int wakeLock
             }
             if (acquiredFd && acquiredFd->isValid()) {
                 auto result = lseek(acquiredFd->get(), 0, SEEK_SET);
-                if (result < 0) {
+                if (result != 0) {
                     PLOG(ERROR) << "Could not seek to start of FD for " << ss->statName;
-                    acquiredFd.reset();
+                    acquiredFd->invalidate();
                     PLOG(ERROR) << "Closed the FD.";
                 } else {
                     statFd = acquiredFd->get();
                 }
             }
-            if (statFd == -1) {
-                unique_fd tmpFd(TEMP_FAILURE_RETRY(
-                    openat(mKernelWakelockStatsFd, ss->statName.c_str(), O_CLOEXEC | O_RDONLY)));
-                if (tmpFd < 0) {
-                    PLOG(ERROR) << "Error opening " << ss->statName << " for " << kwlId;
-                    continue;
-                }
-                statFd = tmpFd;
-                if (acquiredFd) {
-                    acquiredFd->set(std::move(tmpFd));
-                } else {
-                    auto result = mFdWithMutexCache.emplace(ss->statName, std::move(tmpFd));
-                    acquiredFd = result.first->second.acquire();
-                }
-            }  // acquiredFd is guaranteed to be set here
+            if ((statFd = openFDAndUpdateCache(ss->statName, kwlId, &acquiredFd)) < 0) {
+                continue;
+            }
+            // acquiredFd is guaranteed to be set here.
         } else {
             std::lock_guard<std::mutex> lock(mLock);
             auto it = mFdCache.find(ss->statName);
             if (it != mFdCache.end() && it->second >= 0) {
                 auto result = lseek(it->second, 0, SEEK_SET);
-                if (result < 0) {
+                if (result != 0) {
                     PLOG(ERROR) << "Could not seek to start of FD for " << ss->statName;
                     mFdCache.erase(it);
                     PLOG(ERROR) << "Closed the FD.";
@@ -432,28 +466,36 @@ WakeLockInfo WakeLockEntryList::createKernelEntry(ScratchSpace* ss, int wakeLock
                 }
             }
 
-            if (statFd == -1) {
-                unique_fd tmpFd(TEMP_FAILURE_RETRY(
-                    openat(mKernelWakelockStatsFd, ss->statName.c_str(), O_CLOEXEC | O_RDONLY)));
-                if (tmpFd < 0) {
-                    PLOG(ERROR) << "Error opening " << ss->statName << " for " << kwlId;
-                    continue;
-                }
-                statFd = tmpFd;
-                mFdCache.insert(it, {ss->statName, std::move(tmpFd)});
+            if ((statFd = openFDAndUpdateCache(ss->statName, kwlId, &acquiredFd)) < 0) {
+                continue;
             }
         }  // mLock is released here
 
+        // Try reading from the FD
         ss->valStr.clear();
-        ssize_t n;
-        while ((n = TEMP_FAILURE_RETRY(read(statFd, &ss->readBuff[0], sizeof(ss->readBuff)))) > 0) {
-            ss->valStr.append(ss->readBuff, n);
+        ssize_t n = TEMP_FAILURE_RETRY(read(statFd, &ss->readBuff[0], sizeof(ss->readBuff)));
+
+        // ENODEVICE means that FD was invalidated by the kernel. If so, re-open and re-read.
+        if (n < 0 && errno == ENODEV) {
+            {
+                std::lock_guard<std::mutex> lock(mLock);
+                if ((statFd = openFDAndUpdateCache(ss->statName, kwlId, &acquiredFd)) < 0) {
+                    continue;
+                }
+            }
+            n = TEMP_FAILURE_RETRY(read(statFd, &ss->readBuff[0], sizeof(ss->readBuff)));
         }
+
+        while (n > 0) {
+            ss->valStr.append(ss->readBuff, n);
+            n = TEMP_FAILURE_RETRY(read(statFd, &ss->readBuff[0], sizeof(ss->readBuff)));
+        }
+
         if (n < 0) {
             PLOG(ERROR) << "Error reading " << ss->statName;
             {
                 if (fast_kernel_wakelock_reporting_v2()) {
-                    acquiredFd.reset();
+                    acquiredFd->invalidate();
                 } else {
                     std::lock_guard<std::mutex> lock(mLock);
                     mFdCache.erase(ss->statName);
@@ -546,6 +588,7 @@ void WakeLockEntryList::updateOnAcquire(const std::string& name, int pid) {
         evictIfFull();
         WakeLockInfo newEntry = createNativeEntry(name, pid, timeNow);
         insertEntry(newEntry);
+        mNrActiveHolders[key] = 1;
     } else {
         auto staleEntry = it->second;
         WakeLockInfo updatedEntry = *staleEntry;
@@ -555,9 +598,9 @@ void WakeLockEntryList::updateOnAcquire(const std::string& name, int pid) {
         updatedEntry.activeTime = 0;
         updatedEntry.activeCount++;
         updatedEntry.lastChange = timeNow;
+        mNrActiveHolders[key]++;
 
-        deleteEntry(staleEntry);
-        insertEntry(std::move(updatedEntry));
+        updateEntry(std::move(updatedEntry), staleEntry);
     }
 }
 
@@ -577,23 +620,30 @@ void WakeLockEntryList::updateOnRelease(const std::string& name, int pid) {
 
         // Update entry
         TimestampType timeDelta = timeNow - updatedEntry.lastChange;
-        if (updatedEntry.activeCount > 0) {
-            updatedEntry.activeCount--;
+        if (mNrActiveHolders[key] > 0) {
+            mNrActiveHolders[key]--;
         } else {
-            LOG(ERROR) << "WakeLock Stats: Active count attempted to go below zero for "
+            LOG(ERROR) << "WakeLock Stats: Hold count attempted to go below zero for "
                        << "wakelock \"" << name << "\". This is unexpected.";
         }
-        updatedEntry.isActive = (updatedEntry.activeCount > 0);
+        updatedEntry.isActive = (mNrActiveHolders[key] > 0);
         updatedEntry.activeTime += timeDelta;
         updatedEntry.maxTime = std::max(updatedEntry.maxTime, updatedEntry.activeTime);
         updatedEntry.activeTime = updatedEntry.isActive ? updatedEntry.activeTime : 0;
         updatedEntry.totalTime += timeDelta;
         updatedEntry.lastChange = timeNow;
 
-        deleteEntry(staleEntry);
-        insertEntry(std::move(updatedEntry));
+        updateEntry(std::move(updatedEntry), staleEntry);
     }
 }
+
+void WakeLockEntryList::clear() {
+    std::lock_guard<std::mutex> lock(mLock);
+    mStats.clear();
+    mLookupTable.clear();
+    mNrActiveHolders.clear();
+}
+
 /**
  * Updates the native wakelock stats based on the current time.
  */
@@ -623,6 +673,15 @@ void WakeLockEntryList::getWakeLockStats(int wakeLockInfoFieldBitMask,
         }
     }
     getKernelWakelockStats(wakeLockInfoFieldBitMask, aidl_return);
+}
+
+int WakeLockEntryList::nrActiveHolders(const std::string& name, int pid) {
+    std::lock_guard<std::mutex> lock(mLock);
+    auto key = std::make_pair(name, pid);
+    if (mNrActiveHolders.find(key) != mNrActiveHolders.end()) {
+        return mNrActiveHolders[key];
+    }
+    return 0;
 }
 
 }  // namespace V1_0
